@@ -20,7 +20,7 @@ int multiPoly  = getARGV("-multiPoly", 1);          // polynomial degree for Lam
 
 func Pm = P2; //polynomial degree for M_H continuous trace space (global skeleton)
 func Pk = P2; //polynomial degree for V_h(K) volume space (local)
-func Pl = P1dc; //polynomial degree for Lambda_H(K) broken multiplier space (local)
+func Pl = P0; //polynomial degree for Lambda_H(K) broken multiplier space (local)
 
 string directory = "mh2m-cM"    + coarseMesh
                  + "-eM"        + edgeMesh
@@ -183,7 +183,7 @@ for(int K = 0; K < nK; K++){
 
     // Augmented saddle-point system (size ndofV+1)
     matrix AAk = [[Ak,   bVec ],
-                  [bVec', -1e-15 ]]; //not zero to avoid singularity; effectively zero in the FE sense
+                  [bVec', 0.0 ]]; //not zero to avoid singularity; effectively zero in the FE sense
     set(AAk, solver=sparsesolver);
 
     varf varAvg(unused, psi) = int1d(auxEh)(psi);
