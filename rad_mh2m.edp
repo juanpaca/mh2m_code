@@ -53,10 +53,10 @@ real x0 = 0.0, x1 = 1.0;
 real y0 = 0.0, y1 = 1.0;
 
 // Define as funcs (standard FreeFem++ syntax, evaluated at current (x,y))
-func varepsilon = 3.0; //diffusion
+func varepsilon = 1.0; //diffusion
 //advection
 func a1 = 1.0; 
-func a2 = 2.0;
+func a2 = 1.0;
 
 func uExact   = sin(2*pi*x) * sin(pi*y);
 func dxuExact = 2*pi*cos(2*pi*x) * sin(pi*y);
