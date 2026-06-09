@@ -10,7 +10,7 @@ load "qf11to25"
 
 //macros
 macro grad(u) [dx(u), dy(u)] // 
-macro alpha(a1, a2) [alpha1, alpha2] //end macros
+macro alpha(a1, a2) [a1, a2] //end macros
 
 
 verbosity = 0;
@@ -53,10 +53,10 @@ real x0 = 0.0, x1 = 1.0;
 real y0 = 0.0, y1 = 1.0;
 
 // Define as funcs (standard FreeFem++ syntax, evaluated at current (x,y))
-func varepsilon = 1.; //diffusion
+func varepsilon = 3.0; //diffusion
 //advection
 func a1 = 1.0; 
-func a2 = 1.0;
+func a2 = 2.0;
 
 func uExact   = sin(2*pi*x) * sin(pi*y);
 func dxuExact = 2*pi*cos(2*pi*x) * sin(pi*y);
@@ -143,8 +143,10 @@ int nLocalM   = MHK0.ndof;      // dim M_H|_{dK}
 // --- Basis function storage ---
 // EtaMatAll(K*ndofVhK + d, i) = d-th DOF of eta_i^K in V_h(K)
 // etafAll  (K, d)              = d-th DOF of eta_f^K in V_h(K)
+// etaQAll(K, d)              = d-th DOF of eta_Q^K in V_h(K) (not needed for pure diffusion, but would be for advection)
 real[int,int] EtaMatAll(nK * ndofVhK, mFluctMax);  EtaMatAll = 0.0;
 real[int,int] etafAll  (nK, ndofVhK);               etafAll   = 0.0;
+real[int,int] etaQAll  (nK, ndofVhK);               etaQAll   = 0.0;
 
 // --- Schur condensation data ---
 // SlamAll(K*mFluctMax + i, j) = (i,j) entry of S_lambda^K
@@ -184,8 +186,10 @@ for(int K = 0; K < nK; K++){
     // Perimeter of K (measure of dK)
     real dKperim = int1d(auxEh)(1.0);
 
-    // Local stiffness: a_K(u,v) = (grad u, grad v)_K
-    varf varAk(u, v) = int2d(auxTh)(dx(u)*dx(v) + dy(u)*dy(v));
+    // Local stiffness: a_K(u,v) = (grad u, grad v)_K + 0.5(alpha · grad u, v)_K - 0.5(alpha · grad v, u)_K
+    varf varAk(u, v) = int2d(auxTh)(varepsilon * grad(u)' * grad(v) 
+                    + 0.5* alpha(a1, a2)' * grad(u) * v 
+                    - 0.5* alpha(a1, a2)' * grad(v) * u);
     matrix Ak = varAk(VhK, VhK);
 
     varf varBc(unused, v) = int1d(auxTh)(1.0 * v);
@@ -213,16 +217,29 @@ for(int K = 0; K < nK; K++){
         Z(j0, col) = -avgVec[i] / avgVec[j0];
         col++;
     }
- 
+    
+    //solving for etaf^K and etaQ^K
     varf varF(unused, v) = int2d(auxTh)(fSource * v);
+    varf varQ(unused, v) =  int2d(auxTh)( 0.5 * alpha(a1, a2)' * grad(v) ); 
     real[int] rhsF = varF(0, VhK);
+    real[int] rhsQ = varQ(0, VhK);
 
     real[int] rhsFaug(ndofV + 1);
-    for(int d = 0; d < ndofV; d++) rhsFaug[d] = rhsF[d];
+    real[int] rhsQaug(ndofV + 1);
+
+    for(int d = 0; d < ndofV; d++) {
+        rhsFaug[d] = rhsF[d];
+        rhsQaug[d] = rhsQ[d];
+        }
     rhsFaug[ndofV] = 0.0;
+    rhsQaug[ndofV] = 0.0;
 
     real[int] solF = AAk^-1 * rhsFaug;
-    for(int d = 0; d < ndofV; d++) etafAll(K, d) = solF[d];
+    real[int] solQ = AAk^-1 * rhsQaug;
+
+    for(int d = 0; d < ndofV; d++){ etafAll(K, d) = solF[d];
+        etaQAll(K, d) = solQ[d];
+    }
 
     real[int,int] Fkl(ndofV, mFluct);
     LhK lamFunc; 
@@ -268,12 +285,6 @@ for(int K = 0; K < nK; K++){
         mDofsAll(K, j) = globVec.imax;
     }
 
-    // v0^K: boundary average of M_H basis functions on dK
-    varf varMHavg(unused, chi) = int1d(auxEh)(chi);
-    real[int] mhAvgLocal = varMHavg(0, MHK);
-    for(int j = 0; j < nLocM; j++)
-        v0KAll(K, j) = mhAvgLocal[j] / dKperim;
-
     // M_rho^K: Lambda_tilde x M_H coupling (via Z projection)
     varf varMmuChi(mu, chi) = int1d(auxEh)(mu * chi);
     matrix MmuChi = varMmuChi(LhK, MHK);  // (nLocM x mLam) after transpose
@@ -289,12 +300,29 @@ for(int K = 0; K < nK; K++){
         }
     }
 
+    // v0^K: boundary average of M_H basis functions on dK
+    // ef^K: <psi, etaf^K>
+    // eQ^K: <psi, etaQ^K> 
+
+    varf varMHavg(unused, chi) = int1d(auxEh)(chi);
+    
+    real[int] mhAvgLocal = varMHavg(0, MHK);
+    for(int j = 0; j < nLocM; j++)
+        v0KAll(K, j) = mhAvgLocal[j] / dKperim;
+
     // e_f^K: boundary load of eta_f^K against zero-mean multipliers
+    // e_Q^K: boundary load of eta_Q^K against zero-mean multipliers 
     real[int] efK(mFluct);
+    real[int] eQK(mFluct);
     for(int i = 0; i < mFluct; i++){
-        real val = 0.0;
-        for(int d = 0; d < ndofV; d++) val += Fkl(d, i) * etafAll(K, d);
-        efK[i] = val;
+        real val1 = 0.0;
+        real val2 = 0.0;
+        for(int d = 0; d < ndofV; d++) {
+            val1 += Fkl(d, i) * etafAll(K, d);
+            val2 += Fkl(d, i) * etaQAll(K, d);
+        }
+        efK[i] = val1;
+        eQK[i] = val2;
     }
 
     // S_lam^K: solve A^K * col = M_rho^K[:,j]  for each column j
@@ -302,6 +330,7 @@ for(int K = 0; K < nK; K++){
     for(int j = 0; j < nLocM; j++){
         real[int] rhsCol(mFluct);
         for(int i = 0; i < mFluct; i++) rhsCol[i] = MrhoK(i, j);
+        rhsCol -= eQK*v0KAll(K, j);  
         real[int] solCol = matAK^-1 * rhsCol;
         for(int i = 0; i < mFluct; i++){
             SlamK(i, j)                    = solCol[i];
@@ -314,9 +343,32 @@ for(int K = 0; K < nK; K++){
     glamK *= -1.0;
     for(int i = 0; i < mFluct; i++) glamAll[K*mFluctMax + i] = glamK[i];
 
-    // The algebraic multiplication of the source term with v0KAll 
-    // already implicitly handles the 1/|dK| scaling exactly
+    //computing the vector calphaK=1/(2*dK)int_K(alpha*grad eta_Q^K), and scalar cfK=1/(2*dK)int_K(alpha*grad eta_f^K) and cQK=1/(2*dK)int_K(alpha*grad eta_Q^K)
+    varf varAlphaGradEta(unused, v) = int2d(auxTh)(alpha(a1, a2)' * grad(v));
+    real[int] vecAdvection = varAlphaGradEta(0, VhK); //matriz to project alpha*grad(eta) into VhK, then take DOF values as vector entries
+
+    real[int] calphaK(mFluct);
+    calphaK = EtaMat' * vecAdvection; 
+    calphaK *= 1.0/(2.0*dKperim);
+
+    real[int] solFvol = solF(0 : ndofV-1);
+    real cfK = solFvol' * vecAdvection;
+    cfK *= 1.0/(2.0*dKperim);
+    real[int] solQvol = solQ(0 : ndofV-1);
+    real cQK = solQvol' * vecAdvection;
+    cQK *= 1.0/(2.0*dKperim);
+
+    // Obataining row vector S0 and scalar g0
+    real[int] S0K(nLocM);
+    S0K = SlamK' * calphaK ;
+    S0K += cQK * v0KAll(K, :);
+    S0K *= (-1)*dKperim; 
+
     real g0K = int2d(auxTh)(fSource);
+    real auxg0K = calphaK' * glamK ;
+    auxg0K += cfK ;
+    auxg0K *= -dKperim;
+    g0K += auxg0K;
 
     real[int,int] SK(nLocM, nLocM);
     real[int]     RK(nLocM);
@@ -327,7 +379,7 @@ for(int K = 0; K < nK; K++){
         RK[i] = rval;
 
         for(int j = 0; j < nLocM; j++){
-            real sval = 0.0;
+            real sval = S0K[j] * v0KAll(K, i);
             for(int k = 0; k < mFluct; k++) sval += MrhoK(k, i) * SlamK(k, j);
             SK(i, j) = sval;
         }
@@ -382,7 +434,7 @@ MH rhoGlobal;
 rhoGlobal[] = Rho;
 
 cout << "Global solve done.  Trace DOFs = " << numTraceDofs << endl;
-
+ 
 real errL2 = 0.0;
 real errH1 = 0.0;
 
@@ -420,7 +472,7 @@ for(int K = 0; K < nK; K++){
 
     // reconstruct  u_Hh|_K
     VhK uHh;
-    for(int d = 0; d < VhK.ndof; d++) uHh[][d] = etafAll(K, d);
+    for(int d = 0; d < VhK.ndof; d++) uHh[][d] = etafAll(K, d) + u0K * etaQAll(K, d);
 
     // add flux multiscale contributions: sum_i tlam_i * eta_i^K
     for(int i = 0; i < mFluct; i++){
@@ -464,7 +516,7 @@ real L2err = sqrt(errL2);
 real H1err = sqrt(errH1);
 
 cout << "=================================================" << endl;
-cout << "  MH2M Results (Pure Diffusion / Darcy)         " << endl;
+cout << "  MH2M Results (Advection - Diffusion)          " << endl;
 cout << "=================================================" << endl;
 cout << "  nK  (macro elements)   = " << nK            << endl;
 cout << "  Trace DOFs  (M_H)      = " << numTraceDofs  << endl;
@@ -479,3 +531,4 @@ real localMeshSize = Th[0].hmax;
 real edgeMeshSize = GlobalEdgeMesh.hmax;
 
 cout << globalMeshSize << " " << edgeMeshSize << " " << localMeshSize << " " << numTraceDofs << " " << L2err << " " << H1err << endl;
+
