@@ -1,0 +1,10 @@
+
+func uExact  = (1.0/a2)*(y - ( sinh( (a2*y)/(2*kappaVal) ) )/(  sinh( a2/(2*kappaVal) )   ) *exp( (a2/(2*kappaVal))*(y-1) )  ) ;
+func dxuExact = 0.0;
+func dyuExact = (1.0/a2) - ( (exp((a2/(2*kappaVal))*(y-1))) / (2.0*kappaVal*sinh(a2/(2*kappaVal))) ) * ( cosh((a2*y)/(2*kappaVal)) + sinh((a2*y)/(2*kappaVal)) );
+
+
+func uExact   = sin(2*pi*x) * sin(pi*y);
+// func dxuExact = 2*pi*cos(2*pi*x) * sin(pi*y);
+// func dyuExact = pi*sin(2*pi*x) * cos(pi*y);
+// func fSource  = varepsilon * (5*pi^2)*uExact + a1*dxuExact + a2*dyuExact;
