@@ -1,0 +1,481 @@
+// =========================================================================
+// MH2M Method for Advection-Diffusion 
+//   polynomial degrees used here: (P{k+1} (F) traces / Pkdc(F) multipliers / P{k+1} (K) volumetric)
+// =========================================================================
+
+include "getARGV.idp"
+load "Element_P3"
+load "iovtk"
+load "qf11to25"
+
+//macros
+macro grad(u) [dx(u), dy(u)] // 
+macro alpha(a1, a2) [alpha1, alpha2] //end macros
+
+
+verbosity = 0;
+
+int coarseMesh = getARGV("-cM",    2);  // coarse mesh refinement level
+int subMesh    = getARGV("-subM",  0);  // local sub-mesh refinement (calT^K)
+int edgeMesh   = getARGV("-edgeM", 0);  // skeleton edge refinement (Xi_H^K)
+int exportVTK  = getARGV("-vtk",   0);  // 1 = export VTK files
+int tracePoly  = getARGV("-tracePoly", 2);                     // polynomial degree for M_H trace space (P_m with m=TracePoly)
+int volPoly    = getARGV("-volPoly",   2);              // polynomial degree for V_h(K) volume space (P_k with k=VolPoly)
+int multiPoly  = getARGV("-multiPoly", 1);          // polynomial degree for Lambda_H(K) multiplier space (P_l with l=MultiPoly)
+
+func Pm = P2; //polynomial degree for M_H continuous trace space (global skeleton)
+func Pk = P2; //polynomial degree for V_h(K) volume space (local)
+func Pl = P0; //polynomial degree for Lambda_H(K) broken multiplier space (local)
+
+string directory = "mh2m-cM"    + coarseMesh
+                 + "-eM"        + edgeMesh
+                 + "-sM"        + subMesh;
+exec("mkdir -p " + directory);
+
+cout << "=================================================" << endl;
+cout << "  MH2M  Advection-Diffusion Solver              " << endl;
+cout << "  cM=" << coarseMesh << "  edgeM=" << edgeMesh
+     << "  subM=" << subMesh  << endl;
+cout << "  k=2 (P2)  l=0 (P1dc)  m=2 (P2)              " << endl;
+cout << "=================================================" << endl;
+
+// =========================================================================
+// Problem Data
+// =========================================================================
+// div( (a1,a2) u - A grad u ) = f  in Omega = (0,1)^2,   u = 0  on dOmega
+//
+// Manufactured solution:
+//   u   = sin(2*pi*x)*sin(pi*y)
+//   f   = 
+// =========================================================================
+
+real x0 = 0.0, x1 = 1.0;
+real y0 = 0.0, y1 = 1.0;
+
+// Define as funcs (standard FreeFem++ syntax, evaluated at current (x,y))
+func varepsilon = 1.; //diffusion
+//advection
+func a1 = 1.0; 
+func a2 = 1.0;
+
+func uExact   = sin(2*pi*x) * sin(pi*y);
+func dxuExact = 2*pi*cos(2*pi*x) * sin(pi*y);
+func dyuExact = pi*sin(2*pi*x) * cos(pi*y);
+func fSource  = varepsilon * (5*pi^2)*uExact + a1*dxuExact + a2*dyuExact;
+
+int globalH = 2^coarseMesh;
+mesh calP = square(globalH, globalH,
+                   [x0 + (x1-x0)*x, y0 + (y1-y0)*y]);
+int nK = calP.nt;
+
+cout << "Macro partition calP: " << nK << " triangles, "
+     << calP.nv << " vertices" << endl;
+
+meshL[int] EdgeH(nK);
+mesh[int]  Th(nK);
+
+int[int] edgeLabels = [11, 22, 33];
+
+for(int K = 0; K < nK; K++){
+    // Vertices of macro-triangle K
+    real x0K = calP[K][0].x,  y0K = calP[K][0].y;
+    real x1K = calP[K][1].x,  y1K = calP[K][1].y;
+    real x2K = calP[K][2].x,  y2K = calP[K][2].y;
+
+    // Three oriented edge borders of triangle K (one point each for minimal mesh)
+    border edgeF0(t=0,1){
+        P.x = x1K + t*(x2K-x1K);
+        P.y = y1K + t*(y2K-y1K);
+        label = 11;
+    }
+    border edgeF1(t=0,1){
+        P.x = x2K + t*(x0K-x2K);
+        P.y = y2K + t*(y0K-y2K);
+        label = 22;
+    }
+    border edgeF2(t=0,1){
+        P.x = x0K + t*(x1K-x0K);
+        P.y = y0K + t*(y1K-y0K);
+        label = 33;
+    }
+
+    // Minimal triangulation of K (one point per edge => one triangle)
+    mesh ThKmin = buildmesh(edgeF0(1) + edgeF1(1) + edgeF2(1));
+    // Xi_H^K: skeleton-level refinement (determines calE_H resolution)
+    mesh ThKxi = trunc(ThKmin, 1, split = 2^edgeMesh);
+    // calE_H(K): 1D boundary mesh of Xi_H^K  =  dK discretisation
+    EdgeH[K] = extract(ThKxi, label = edgeLabels);
+    // calT^K: fine volume mesh for local FE solve
+    Th[K] = trunc(ThKxi, 1, split = 2^subMesh);
+}
+
+meshL GlobalEdgeMesh = EdgeH[0];
+for(int K = 1; K < nK; K++)
+    GlobalEdgeMesh = GlobalEdgeMesh + EdgeH[K];
+
+// M_H: C^0 Pm on the global skeleton
+fespace MH(GlobalEdgeMesh, Pm);
+int numTraceDofs = MH.ndof;
+
+// Identify boundary DOFs: nodes on dOmega = {x=0} u {x=1} u {y=0} u {y=1}
+func onBnd = (abs(x -x0) < 1e-11) || (abs(x -x1) < 1e-11)
+           || (abs(y -y0) < 1e-11) || (abs(y -y1) < 1e-11);
+
+MH bndMaskFn  = onBnd;
+real[int] isBndDof = bndMaskFn[];  // 1.0 at Dirichlet DOFs, 0.0 elsewhere
+
+// Exact Dirichlet values at boundary DOFs (uExact = 0 on dOmega, but set
+// correctly in general so the code works for non-homogeneous BC)
+MH exactTraceFn = uExact;
+real[int] bndDofVals = exactTraceFn[];
+
+cout << "Global skeleton M_H:  " << numTraceDofs << " DOFs" << endl;
+
+fespace VhK0(Th[0],    Pk);    // V_h(K):       C^0 Pk on calT^K
+fespace LhK0(EdgeH[0], Pl);  // Lambda_H(K):  broken Pl on calE_H(K)
+fespace MHK0(EdgeH[0], Pm);    // M_H|_{dK}:    C^0 Pm on dK
+
+int ndofVhK   = VhK0.ndof;      // dim V_h(K)
+int mLamMax   = LhK0.ndof;      // dim Lambda_H(K)
+int mFluctMax = mLamMax - 1;    // dim Lambda_tilde_H(K)
+int nLocalM   = MHK0.ndof;      // dim M_H|_{dK}
+
+// --- Basis function storage ---
+// EtaMatAll(K*ndofVhK + d, i) = d-th DOF of eta_i^K in V_h(K)
+// etafAll  (K, d)              = d-th DOF of eta_f^K in V_h(K)
+real[int,int] EtaMatAll(nK * ndofVhK, mFluctMax);  EtaMatAll = 0.0;
+real[int,int] etafAll  (nK, ndofVhK);               etafAll   = 0.0;
+
+// --- Schur condensation data ---
+// SlamAll(K*mFluctMax + i, j) = (i,j) entry of S_lambda^K
+// glamAll(K*mFluctMax + i)    = i-th component of g_lambda^K
+real[int,int] SlamAll(nK * mFluctMax, nLocalM);  SlamAll = 0.0;
+real[int]     glamAll(nK * mFluctMax);            glamAll = 0.0;
+
+// --- Constant part data ---
+// v0KAll(K, j)    = j-th component of v0^K  (average of xi_j over dK / |dK|)
+// mDofsAll(K, j)  = global DOF index in M_H corresponding to local DOF j on dK
+real[int,int] v0KAll  (nK, nLocalM);  v0KAll  = 0.0;
+int[int,int]  mDofsAll(nK, nLocalM);  mDofsAll = 0;
+
+// --- Global sparse system triplets (COO format) ---
+// Upper bound on nonzeros: each K contributes nLocalM^2 entries,
+// plus one entry per Dirichlet DOF, plus one sentinel.
+int maxNnz = nK * nLocalM * nLocalM + numTraceDofs + 2;
+int[int]  Iglob(maxNnz);  Iglob = 0;
+int[int]  Jglob(maxNnz);  Jglob = 0;
+real[int] Cglob(maxNnz);  Cglob = 0.0;
+real[int] Rglob(numTraceDofs);  Rglob = 0.0;
+int idxNnz = 0;
+
+for(int K = 0; K < nK; K++){
+    mesh  auxTh = Th[K];
+    meshL auxEh = EdgeH[K];
+
+    fespace VhK(auxTh, Pk);    // V_h(K)
+    fespace LhK(auxEh, Pl);  // Lambda_H(K)
+    fespace MHK(auxEh, Pm);    // M_H|_{dK}
+
+    int mLam   = LhK.ndof;     // dim Lambda_H(K)
+    int mFluct = mLam - 1;     // dim Lambda_tilde_H(K)
+    int ndofV  = VhK.ndof;     // dim V_h(K)
+    int nLocM  = MHK.ndof;     // dim M_H|_{dK}
+
+    // Perimeter of K (measure of dK)
+    real dKperim = int1d(auxEh)(1.0);
+
+    // Local stiffness: a_K(u,v) = (grad u, grad v)_K
+    varf varAk(u, v) = int2d(auxTh)(dx(u)*dx(v) + dy(u)*dy(v));
+    matrix Ak = varAk(VhK, VhK);
+
+    varf varBc(unused, v) = int1d(auxTh)(1.0 * v);
+    real[int] bVec = varBc(0, VhK);
+
+    // Augmented saddle-point system (size ndofV+1)
+    matrix AAk = [[Ak,   bVec ],
+                  [bVec', 0.0 ]]; //not zero to avoid singularity; effectively zero in the FE sense
+    set(AAk, solver=sparsesolver);
+
+    varf varAvg(unused, psi) = int1d(auxEh)(psi);
+    real[int] avgVec = varAvg(0, LhK);
+
+    // Find pivot: largest absolute average
+    int j0 = 0;
+    for(int i = 1; i < mLam; i++)
+        if(abs(avgVec[i]) > abs(avgVec[j0])) j0 = i;
+
+    real[int,int] Z(mLam, mFluct);
+    Z = 0.0;
+    int col = 0;
+    for(int i = 0; i < mLam; i++){
+        if(i == j0) continue;
+        Z(i,  col) =  1.0;
+        Z(j0, col) = -avgVec[i] / avgVec[j0];
+        col++;
+    }
+ 
+    varf varF(unused, v) = int2d(auxTh)(fSource * v);
+    real[int] rhsF = varF(0, VhK);
+
+    real[int] rhsFaug(ndofV + 1);
+    for(int d = 0; d < ndofV; d++) rhsFaug[d] = rhsF[d];
+    rhsFaug[ndofV] = 0.0;
+
+    real[int] solF = AAk^-1 * rhsFaug;
+    for(int d = 0; d < ndofV; d++) etafAll(K, d) = solF[d];
+
+    real[int,int] Fkl(ndofV, mFluct);
+    LhK lamFunc; 
+    varf varFklCol(unused, v) = int1d(auxTh)(lamFunc * v);
+
+    for(int j = 0; j < mFluct; j++){
+        for(int r = 0; r < mLam; r++) lamFunc[][r] = Z(r, j);
+        real[int] Fcol = varFklCol(0, VhK);
+        for(int d = 0; d < ndofV; d++) Fkl(d, j) = Fcol[d];
+    }
+
+    real[int,int] EtaMat(ndofV, mFluct);
+    for(int j = 0; j < mFluct; j++){
+        real[int] rhsEta(ndofV + 1);
+        for(int d = 0; d < ndofV; d++) rhsEta[d] = -Fkl(d, j);
+        rhsEta[ndofV] = 0.0;
+
+        real[int] solEta = AAk^-1 * rhsEta;
+        for(int d = 0; d < ndofV; d++){
+            EtaMat(d, j)                 = solEta[d];
+            EtaMatAll(K*ndofVhK + d, j)  = solEta[d];
+        }
+    }
+
+    real[int,int] AK(mFluct, mFluct);
+    for(int i = 0; i < mFluct; i++)
+        for(int j = 0; j < mFluct; j++){
+            real val = 0.0;
+            for(int d = 0; d < ndofV; d++) val += Fkl(d, i) * EtaMat(d, j);
+            AK(i, j) = val;
+        }
+    matrix matAK = AK;
+    set(matAK, solver=sparsesolver);
+
+    // Local-to-global trace DOF map via interpolation matrix
+    matrix RestrictK = interpolate(MHK, MH);
+
+    int[int] mDofs(nLocM);
+    for(int j = 0; j < nLocM; j++){
+        real[int] locUnit(nLocM);  locUnit = 0.0;  locUnit[j] = 1.0;
+        real[int] globVec = RestrictK' * locUnit;
+        mDofs[j]       = globVec.imax;
+        mDofsAll(K, j) = globVec.imax;
+    }
+
+    // v0^K: boundary average of M_H basis functions on dK
+    varf varMHavg(unused, chi) = int1d(auxEh)(chi);
+    real[int] mhAvgLocal = varMHavg(0, MHK);
+    for(int j = 0; j < nLocM; j++)
+        v0KAll(K, j) = mhAvgLocal[j] / dKperim;
+
+    // M_rho^K: Lambda_tilde x M_H coupling (via Z projection)
+    varf varMmuChi(mu, chi) = int1d(auxEh)(mu * chi);
+    matrix MmuChi = varMmuChi(LhK, MHK);  // (nLocM x mLam) after transpose
+
+    real[int,int] MrhoK(mFluct, nLocM);
+    for(int j = 0; j < nLocM; j++){
+        real[int] chiUnit(nLocM);  chiUnit = 0.0;  chiUnit[j] = 1.0;
+        real[int] MchiCol = MmuChi' * chiUnit;  // column j of MmuChi, length mLam
+        for(int i = 0; i < mFluct; i++){
+            real val = 0.0;
+            for(int r = 0; r < mLam; r++) val += Z(r, i) * MchiCol[r];
+            MrhoK(i, j) = val;
+        }
+    }
+
+    // e_f^K: boundary load of eta_f^K against zero-mean multipliers
+    real[int] efK(mFluct);
+    for(int i = 0; i < mFluct; i++){
+        real val = 0.0;
+        for(int d = 0; d < ndofV; d++) val += Fkl(d, i) * etafAll(K, d);
+        efK[i] = val;
+    }
+
+    // S_lam^K: solve A^K * col = M_rho^K[:,j]  for each column j
+    real[int,int] SlamK(mFluct, nLocM);
+    for(int j = 0; j < nLocM; j++){
+        real[int] rhsCol(mFluct);
+        for(int i = 0; i < mFluct; i++) rhsCol[i] = MrhoK(i, j);
+        real[int] solCol = matAK^-1 * rhsCol;
+        for(int i = 0; i < mFluct; i++){
+            SlamK(i, j)                    = solCol[i];
+            SlamAll(K*mFluctMax + i, j)    = solCol[i];
+        }
+    }
+
+    // g_lam^K: solve A^K * x = e_f^K, then negate
+    real[int] glamK = matAK^-1 * efK;
+    glamK *= -1.0;
+    for(int i = 0; i < mFluct; i++) glamAll[K*mFluctMax + i] = glamK[i];
+
+    // The algebraic multiplication of the source term with v0KAll 
+    // already implicitly handles the 1/|dK| scaling exactly
+    real g0K = int2d(auxTh)(fSource);
+
+    real[int,int] SK(nLocM, nLocM);
+    real[int]     RK(nLocM);
+
+    for(int i = 0; i < nLocM; i++){
+        real rval = -g0K * v0KAll(K, i);
+        for(int k = 0; k < mFluct; k++) rval -= MrhoK(k, i) * glamK[k];
+        RK[i] = rval;
+
+        for(int j = 0; j < nLocM; j++){
+            real sval = 0.0;
+            for(int k = 0; k < mFluct; k++) sval += MrhoK(k, i) * SlamK(k, j);
+            SK(i, j) = sval;
+        }
+    }
+
+    // Scatter into global triplet arrays (interior rows only)
+    for(int i = 0; i < nLocM; i++){
+        int gi = mDofs[i];
+        if(isBndDof[gi] < 0.5){
+            Rglob[gi] += RK[i];
+            for(int j = 0; j < nLocM; j++){
+                Iglob[idxNnz] = gi;
+                Jglob[idxNnz] = mDofs[j];
+                Cglob[idxNnz] = SK(i, j);
+                idxNnz++;
+            }
+        }
+    }
+
+    if((K % max(1, nK/10)) == 0)
+        cout << "  K = " << K << " / " << nK << " done" << endl;
+}
+
+cout << "Offline complete.  Total NNZ = " << idxNnz << endl;
+
+// Add identity rows for Dirichlet DOFs
+for(int i = 0; i < numTraceDofs; i++){
+    if(isBndDof[i] > 0.5){
+        Rglob[i]      = bndDofVals[i];
+        Iglob[idxNnz] = i;
+        Jglob[idxNnz] = i;
+        Cglob[idxNnz] = 1.0;
+        idxNnz++;
+    }
+}
+
+// Sentinel entry to avoid empty-slice errors in FreeFem++ sparse constructor
+Iglob[idxNnz] = numTraceDofs - 1;
+Jglob[idxNnz] = numTraceDofs - 1;
+Cglob[idxNnz] = 0.0;
+idxNnz++;
+
+// Build global Schur complement matrix from COO triplets
+matrix Smat = [Iglob(0:idxNnz-1),
+               Jglob(0:idxNnz-1),
+               Cglob(0:idxNnz-1)];
+set(Smat, solver=sparsesolver);
+
+// Solve for global trace DOFs rho
+real[int] Rho = Smat^-1 * Rglob;
+MH rhoGlobal;
+rhoGlobal[] = Rho;
+
+cout << "Global solve done.  Trace DOFs = " << numTraceDofs << endl;
+
+real errL2 = 0.0;
+real errH1 = 0.0;
+
+ofstream pvdFile(directory + "/solution.pvd");
+if(exportVTK){
+    pvdFile << "<VTKFile type=\"Collection\" version=\"0.1\">\n";
+    pvdFile << "  <Collection>\n";
+}
+
+for(int K = 0; K < nK; K++){
+    mesh  auxTh = Th[K];
+    meshL auxEh = EdgeH[K];
+
+    fespace VhK(auxTh, Pk);
+    fespace LhK(auxEh, Pl);
+
+    int mFluct = LhK.ndof - 1;
+
+    // extract local trace vector rho^K from global solution
+    real[int] rhoK(nLocalM);
+    for(int j = 0; j < nLocalM; j++)
+        rhoK[j] = Rho[ mDofsAll(K, j) ];
+
+    // recover constant part  u0_K = v0^K · rho^K
+    real u0K = 0.0;
+    for(int j = 0; j < nLocalM; j++) u0K += v0KAll(K, j) * rhoK[j];
+
+    // recover fluctuation multipliers  tlam^K = S_lam^K * rho^K + g_lam^K
+    real[int] tlamK(mFluct);
+    for(int i = 0; i < mFluct; i++){
+        tlamK[i] = glamAll[K * mFluctMax + i];
+        for(int j = 0; j < nLocalM; j++)
+            tlamK[i] += SlamAll(K * mFluctMax + i, j) * rhoK[j];
+    }
+
+    // reconstruct  u_Hh|_K
+    VhK uHh;
+    for(int d = 0; d < VhK.ndof; d++) uHh[][d] = etafAll(K, d);
+
+    // add flux multiscale contributions: sum_i tlam_i * eta_i^K
+    for(int i = 0; i < mFluct; i++){
+        VhK etaKi;
+        for(int d = 0; d < VhK.ndof; d++)
+            etaKi[][d] = EtaMatAll(K * ndofVhK + d, i);
+        uHh[] += tlamK[i] * etaKi[];
+    }
+
+    //add constant part u0_K as a uniform function on V_h(K)
+    VhK u0Kfn = u0K;   // projects constant u0K into V_h(K)
+    uHh[] += u0Kfn[];
+
+    // Local L2 and H1 error contributions
+    errL2 += int2d(auxTh,optimize = 0)( (uHh - uExact)^2 );
+    errH1 += int2d(auxTh,optimize = 0)( (dx(uHh) - dxuExact)^2
+                         + (dy(uHh) - dyuExact)^2 );
+
+    // Optional VTK export
+    if(exportVTK){
+        mesh ThViz = trunc(Th[K], 1, split=4);
+        fespace VhViz(ThViz, P1);
+        VhViz uViz = uHh;
+        int[int] vtkOrder = [1];
+        savevtk(directory + "/uh-K" + K + ".vtu",
+                ThViz, uViz,
+                dataname="u_Hh",
+                order=vtkOrder);
+        pvdFile << "    <DataSet file=\"uh-K" << K << ".vtu\"/>\n";
+    }
+}
+
+if(exportVTK)
+    pvdFile << "  </Collection>\n</VTKFile>\n";
+
+// =========================================================================
+// Results Output
+// =========================================================================
+
+real L2err = sqrt(errL2);
+real H1err = sqrt(errH1);
+
+cout << "=================================================" << endl;
+cout << "  MH2M Results (Pure Diffusion / Darcy)         " << endl;
+cout << "=================================================" << endl;
+cout << "  nK  (macro elements)   = " << nK            << endl;
+cout << "  Trace DOFs  (M_H)      = " << numTraceDofs  << endl;
+cout << "  LaM DOFs (Lambda_H)    = " << mLamMax*nK       << endl;
+cout << "  L2  error              = " << L2err         << endl;
+cout << "  H1 semi-error          = " << H1err         << endl;
+cout << "=================================================" << endl;
+
+//cout for convergence
+real globalMeshSize = calP.hmax;
+real localMeshSize = Th[0].hmax;
+real edgeMeshSize = GlobalEdgeMesh.hmax;
+
+cout << globalMeshSize << " " << edgeMeshSize << " " << localMeshSize << " " << numTraceDofs << " " << L2err << " " << H1err << endl;
