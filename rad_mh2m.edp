@@ -22,9 +22,9 @@ int subMesh    = getARGV("-subM",    0);  // h: local volume sub-mesh refinement
 int exportVTK  = getARGV("-vtk",     0);  // 1 = export VTK files
 
 // Polynomial degrees based on the optimal MH2M Triplet
-func Pm = P1;   // P_{k+1} for M_{H_Gamma} continuous trace space 
-func Pk = P1;   // P_{k+1} for V_h(K) volume space 
-func Pl = P0;   // P_k^{dc} for Lambda_{H_Lambda} broken multiplier space 
+func Pm = P3;   // P_{k+1} for M_{H_Gamma} continuous trace space 
+func Pk = P3;   // P_{k+1} for V_h(K) volume space 
+func Pl = P1dc;   // P_k^{dc} for Lambda_{H_Lambda} broken multiplier space 
 
 string directory = "mh2m-cM" + coarseMesh + "-tM" + traceMesh + "-mM" + multiMesh + "-sM" + subMesh;
 exec("mkdir -p " + directory);
@@ -40,7 +40,7 @@ cout << "=================================================" << endl;
 real x0 = 0.0, x1 = 1.0;
 real y0 = 0.0, y1 = 1.0;
 
-func varepsilon = 1.0; 
+func varepsilon = 1.0e-2; 
 func a1 = 0.0; 
 func a2 = 1.0;
 
@@ -336,9 +336,7 @@ cout << "Offline complete.  Total NNZ = " << idxNnz << endl;
 
 for(int i = 0; i < numTraceDofs; i++){
     if(isBndDof[i] > 0.5){
-        Rglob[i] = bndDofVals[i]; Iglob[idxNnz] = i; Jglob[idxNnz] = i; Cglob[idxNnz] = 1.0; idxNnz++;
-    } else {
-        Iglob[idxNnz] = i; Jglob[idxNnz] = i; Cglob[idxNnz] = 1e-12; idxNnz++; // Ghost DOF protector
+        Rglob[i] = bndDofVals[i]; Iglob[idxNnz] = i; Jglob[idxNnz] = i; Cglob[idxNnz] = 1.0; idxNnz++; //imposing boundary condition
     }
 }
 
