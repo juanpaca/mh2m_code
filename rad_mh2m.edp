@@ -22,9 +22,9 @@ int subMesh    = getARGV("-subM",    0);  // h: local volume sub-mesh refinement
 int exportVTK  = getARGV("-vtk",     0);  // 1 = export VTK files
 
 // Polynomial degrees based on the optimal MH2M Triplet
-func Pm = P3;   // P_{k+1} for M_{H_Gamma} continuous trace space 
-func Pk = P3;   // P_{k+1} for V_h(K) volume space 
-func Pl = P1dc;   // P_k^{dc} for Lambda_{H_Lambda} broken multiplier space 
+func Pm = P1;   // P_{k+1} for M_{H_Gamma} continuous trace space 
+func Pk = P1;   // P_{k+1} for V_h(K) volume space 
+func Pl = P0;   // P_k^{dc} for Lambda_{H_Lambda} broken multiplier space 
 
 string directory = "mh2m-cM" + coarseMesh + "-tM" + traceMesh + "-mM" + multiMesh + "-sM" + subMesh;
 exec("mkdir -p " + directory);
@@ -40,14 +40,15 @@ cout << "=================================================" << endl;
 real x0 = 0.0, x1 = 1.0;
 real y0 = 0.0, y1 = 1.0;
 
-func varepsilon = 1.0e-2; 
+func varepsilon = 1.0; 
 func a1 = 0.0; 
-func a2 = 1.0;
+func a2 = 0.0;
 
-func uExact  = (1.0/a2)*(y - ( sinh( (a2*y)/(2*varepsilon) ) )/(  sinh( a2/(2*varepsilon) )   ) *exp( (a2/(2*varepsilon))*(y-1) )  ) ;
-func dxuExact = 0.0;
-func dyuExact = (1.0/a2) - ( (exp((a2/(2*varepsilon))*(y-1))) / (2.0*varepsilon*sinh(a2/(2*varepsilon))) ) * ( cosh((a2*y)/(2*varepsilon)) + sinh((a2*y)/(2*varepsilon)) );
-func fSource  = 1.0;
+func uExact   = x*(x-1)*y*(y-1);
+func dxuExact = (2*x - 1)*y*(y-1);
+func dyuExact = (2*y - 1)*x*(x-1);
+func fSource  = a1*dxuExact + a2*dyuExact- 2*varepsilon*(x*(x-1) + y*(y-1));
+
 
 int globalH = 2^coarseMesh;
 mesh calP = square(globalH, globalH, [x0 + (x1-x0)*x, y0 + (y1-y0)*y]);
@@ -89,8 +90,8 @@ for(int K = 1; K < nK; K++) GlobalEdgeMesh = GlobalEdgeMesh + EdgeHGamma[K];
 fespace MH(GlobalEdgeMesh, Pm);
 int numTraceDofs = MH.ndof;
 
-//func onBnd = (abs(x -x0) < 1e-11) || (abs(x -x1) < 1e-11) || (abs(y -y0) < 1e-11) || (abs(y -y1) < 1e-11); //everything is Dirichlet
-func onBnd = (abs(y - y0) < 1e-11) || (abs(y - y1) < 1e-11); // Only top and bottom boundaries are Dirichlet in this example
+func onBnd = (abs(x -x0) < 1e-11) || (abs(x -x1) < 1e-11) || (abs(y -y0) < 1e-11) || (abs(y -y1) < 1e-11); //everything is Dirichlet
+//func onBnd = (abs(y - y0) < 1e-11) || (abs(y - y1) < 1e-11); // Only top and bottom boundaries are Dirichlet in this example
 MH bndMaskFn  = onBnd;
 real[int] isBndDof = bndMaskFn[];  
 MH exactTraceFn = uExact;
@@ -350,6 +351,7 @@ real[int] Rho = Smat^-1 * Rglob;
 MH rhoGlobal; rhoGlobal[] = Rho;
 
 real errL2 = 0.0, errH1 = 0.0;
+real relL2u = 0.0, relH1u = 0.0;
 
 ofstream pvdFile(directory + "/solution.pvd");
 if(exportVTK) pvdFile << "<VTKFile type=\"Collection\" version=\"0.1\">\n  <Collection>\n";
@@ -389,7 +391,9 @@ for(int K = 0; K < nK; K++){
     uHh[] += u0Kfn[];
 
     errL2 += int2d(auxTh,optimize = 0)( (uHh - uExact)^2 );
+    relL2u += int2d(auxTh,optimize = 0)( uExact^2 );
     errH1 += int2d(auxTh,optimize = 0)( (dx(uHh) - dxuExact)^2 + (dy(uHh) - dyuExact)^2 );
+    relH1u += int2d(auxTh,optimize = 0)( dxuExact^2 + dyuExact^2 );
 
     if(exportVTK){
         mesh ThViz = trunc(Th[K], 1, split=4);
@@ -402,13 +406,20 @@ for(int K = 0; K < nK; K++){
 }
 if(exportVTK) pvdFile << "  </Collection>\n</VTKFile>\n";
 
-real L2err = sqrt(errL2), H1err = sqrt(errH1);
+real relL2err = sqrt(errL2)/sqrt(relL2u), relH1err = sqrt(errH1)/sqrt(relH1u);
 cout << "=================================================" << endl;
 cout << "  MH2M Results (Advection - Diffusion)          " << endl;
 cout << "=================================================" << endl;
 cout << "  nK  (macro elements)   = " << nK            << endl;
 cout << "  Trace DOFs  (M_HGamma) = " << numTraceDofs  << endl;
 cout << "  LaM DOFs (Lambda_H)    = " << mLamMax*nK    << endl;
-cout << "  L2  error              = " << L2err         << endl;
-cout << "  H1 semi-error          = " << H1err         << endl;
+cout << "  L2  error              = " << relL2err      << endl;
+cout << "  H1 semi-error          = " << relH1err      << endl;
 cout << "=================================================" << endl;
+
+//cout for convergence
+real calH = calP.hmax;
+real HGamma = GlobalEdgeMesh.hmax;
+real HLambda = EdgeHLambda[0].hmax; // Assuming uniformity across elements
+real hLocal = Th[0].hmax; // Assuming uniformity across elements
+cout << calH << " " << HGamma << " " << HLambda << " " << hLocal  << " "<< numTraceDofs << " " << relL2err << " " << relH1err << endl;
